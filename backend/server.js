@@ -1,111 +1,198 @@
-const express = require("express");
-const cors = require("cors");
-require("dotenv").config();
+const express = require('express');
+const cors = require('cors');
+const Groq = require('groq-sdk');
+require('dotenv').config();
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 5000;
+
+
 app.use(express.json());
+app.use(cors({
+  origin: 'http://localhost:3000', // Adjust if your frontend runs on a different port
+}));
 
-const SYSTEM_PROMPT = `You are an AI Public Defender — a compassionate, knowledgeable legal assistant helping individuals who cannot afford a lawyer.
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
-Your role:
-- Explain laws, rights, and legal procedures in simple, clear language
-- Help users understand their situation and available options
-- Guide them through legal processes step by step
-- Always be empathetic — many users are scared and confused
+// ---- TOPIC GUARD ----
+const LEGAL_KEYWORDS = [
+  'arrest', 'charge', 'court', 'lawyer', 'attorney', 'defendant',
+  'rights', 'miranda', 'bail', 'sentence', 'felony', 'misdemeanor',
+  'police', 'warrant', 'search', 'seizure', 'public defender', 'trial',
+  'plea', 'guilty', 'innocent', 'prison', 'jail', 'probation', 'parole',
+  'immigration', 'detained', 'evidence', 'motion', 'hearing', 'judge',
+  'jury', 'criminal', 'legal', 'law', 'constitution', 'amendment',
+  'officer', 'cop', 'stopped', 'handcuffed', 'indicted', 'case'
+];
 
-Rules:
-- Always recommend consulting a real lawyer for serious matters
-- Never give definitive legal advice — guide and inform only
-- Keep responses concise, clear, and in plain English
-- Use numbered steps when explaining procedures
-- Be warm and reassuring in tone`;
+const BLOCKED_TOPICS = [
+  'recipe', 'cook', 'weather', 'sport', 'movie', 'song', 'music',
+  'homework', 'math', 'stock', 'invest', 'game',
+  'travel', 'hotel', 'flight', 'relationship', 'date',
+  'diet', 'fitness', 'shopping', 'fashion'
+];
 
-app.post("/api/chat", async (req, res) => {
-  const { messages, intake, category } = req.body;
+function isLegalTopic(message) {
+  const lower = message.toLowerCase();
+  const hasLegalKeyword = LEGAL_KEYWORDS.some(kw => lower.includes(kw));
+  const hasBlockedTopic = BLOCKED_TOPICS.some(kw => lower.includes(kw));
+  if (hasLegalKeyword) return true;
+  if (hasBlockedTopic) return false;
+  return true;
+}
 
-  const systemPrompt =
-    SYSTEM_PROMPT +
-    (intake ? `\n\nClient Info — Name: ${intake.name}, Charge: ${intake.charge}, State: ${intake.state}. Details: ${intake.details || "None provided."}` : "") +
-    (category ? `\n\nFocus on: ${category}` : "");
+const SYSTEM_PROMPT = `
+You are an AI Public Defender.
+
+You provide general legal information ONLY (not legal advice).
+
+========================
+🔒 STRICT SCOPE RULE
+========================
+You can ONLY answer questions related to:
+- Criminal law
+- Arrests, police encounters
+- Legal rights (Miranda, search, seizure)
+- Bail, court process, sentencing
+- Public defender access
+
+If the question is NOT related to criminal/legal topics:
+Respond ONLY with:
+"⚖️ I'm your AI Public Defender — I can only help with criminal law and legal rights."
+
+========================
+⚠️ CRITICAL RULES
+========================
+- NEVER assume the user is guilty
+- ALWAYS include this disclaimer:
+  "This is general legal information, not legal advice."
+- ALWAYS suggest contacting a real lawyer
+- Laws vary by state — mention this when relevant
+
+========================
+🚨 EMERGENCY (VERY IMPORTANT)
+========================
+If user is being arrested RIGHT NOW:
+Tell them EXACTLY:
+1. Stay calm, do not resist
+2. Say: "I am invoking my right to remain silent."
+3. Say: "I want a lawyer."
+4. Do not answer any questions
+5. Do not consent to searches
+
+========================
+🧠 RESPONSE FORMAT (MANDATORY)
+========================
+Always structure your response like this:
+
+1. ✅ Quick Answer (1–2 lines)
+2. 📘 Explanation (simple language)
+3. ⚖️ Your Rights (bullet points)
+4. 👉 What You Should Do Next (action steps)
+5. ⚠️ Disclaimer
+
+Keep it clear, calm, and supportive.
+Avoid long paragraphs.
+`;
+
+// ---- MAIN CHAT ROUTE ----
+app.post('/api/chat', async (req, res) => {
+  const { message, messages, intake } = req.body;
+
+  const userMessage = message || (messages && messages[messages.length - 1]?.content);
+
+  if (!userMessage) {
+    return res.status(400).json({ error: 'No message provided.' });
+  }
+
+  if (!isLegalTopic(userMessage)) {
+    return res.json({
+      reply: "⚖️ I'm your AI Public Defender — I'm specialized in criminal law and legal rights only. I can't help with that topic, but I'm here if you have questions about your rights, a criminal case, bail, or need help drafting a legal document. What can I help you with?"
+    });
+  }
 
   try {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "llama3-70b-8192",
-        max_tokens: 1024,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...messages,
-        ],
-      }),
+    const chatMessages = messages
+      ? messages.map(m => ({ role: m.role, content: m.content }))
+      : [{ role: 'user', content: userMessage }];
+
+    // Add intake context to system prompt if available
+    const systemWithIntake = intake
+      ? `${SYSTEM_PROMPT}\n\n## CURRENT CLIENT\nName: ${intake.name}\nCharge: ${intake.charge}\nState: ${intake.state}\nDetails: ${intake.details || 'None provided'}`
+      : SYSTEM_PROMPT;
+
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      max_tokens: 1024,
+      messages: [
+        { role: 'system', content: systemWithIntake },
+        ...chatMessages,
+      ],
     });
 
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content || "I couldn't generate a response.";
-    res.json({ reply });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
+    const reply = completion.choices[0].message.content;
+    res.json({ reply, response: reply });
+
+  } catch (error) {
+    console.error('Groq API error:', error);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
 
-app.post("/api/summary", async (req, res) => {
+// ---- SUMMARY ROUTE ----
+app.post('/api/summary', async (req, res) => {
   const { messages, intake } = req.body;
 
-  const conversation = messages
-    .map((m) => `${m.role === "user" ? "Client" : "Defender"}: ${m.content}`)
-    .join("\n");
-
-  const summaryPrompt = `You are summarizing a legal consultation session.
-
-Client: ${intake?.name || "Unknown"}
-Charge: ${intake?.charge || "Unknown"}
-State: ${intake?.state || "Unknown"}
-Details: ${intake?.details || "None"}
-
-Conversation:
-${conversation}
-
-Write a clear, concise summary including:
-1. The charge and situation
-2. Key rights and legal points discussed
-3. Recommended next steps
-4. Important warnings or reminders
-
-Keep it under 300 words. Use plain English.`;
+  if (!messages || !intake) {
+    return res.status(400).json({ error: 'Missing messages or intake data.' });
+  }
 
   try {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "llama3-70b-8192",
-        max_tokens: 1024,
-        messages: [
-          { role: "user", content: summaryPrompt },
-        ],
-      }),
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      max_tokens: 1024,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...messages.map(m => ({ role: m.role, content: m.content })),
+        {
+          role: 'user',
+          content: `Please provide a concise and clear case summary for ${intake.name} who is facing a charge of "${intake.charge}" in ${intake.state}.
+Include:
+1. Key legal rights relevant to this charge
+2. What to expect in the legal process
+3. Recommended next steps
+4. Important resources they should contact
+Keep it clear, empathetic, and easy to understand.`
+        }
+      ],
     });
 
-    const data = await response.json();
-    const summary = data.choices?.[0]?.message?.content || "Could not generate summary.";
-    res.json({ summary });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Something went wrong." });
+    let reply = completion.choices[0].message.content;
+
+// Optional: enforce fallback if model goes off-topic
+if (!reply || reply.length < 10) {
+  reply = "⚖️ I couldn't understand fully. Please ask about your legal rights or situation.";
+}
+
+// Trim overly long responses
+if (reply.length > 3000) {
+  reply = reply.substring(0, 3000) + "...";
+}
+
+res.json({ reply });
+
+  } catch (error) {
+    console.error('Summary error:', error);
+    res.status(500).json({ error: 'Could not generate summary. Please try again.' });
   }
 });
 
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+app.get('/', (req, res) => {
+  res.send('AI Public Defender Backend is running ✅');
+});
 
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+});
